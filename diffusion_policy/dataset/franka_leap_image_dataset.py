@@ -1,4 +1,5 @@
 from typing import Dict
+from typing import Optional
 import copy
 
 import numpy as np
@@ -24,10 +25,10 @@ class FrankaLeapImageDataset(BaseImageDataset):
         horizon: int = 1,
         pad_before: int = 0,
         pad_after: int = 0,
-        n_obs_steps: int | None = None,
+        n_obs_steps: Optional[int] = None,
         seed: int = 42,
         val_ratio: float = 0.0,
-        max_train_episodes: int | None = None,
+        max_train_episodes: Optional[int] = None,
         load_to_memory: bool = False,
     ):
         super().__init__()

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import zarr
@@ -12,7 +13,7 @@ def _require_key(group, key: str):
     return group[key]
 
 
-def _check_shape(name: str, array, expected_ndim: int, expected_last_dim: int | None = None):
+def _check_shape(name: str, array, expected_ndim: int, expected_last_dim: Optional[int] = None):
     if array.ndim != expected_ndim:
         raise RuntimeError(f"`{name}` must have ndim={expected_ndim}, got shape={array.shape}")
     if expected_last_dim is not None and array.shape[-1] != expected_last_dim:
