@@ -31,6 +31,18 @@ def main():
     parser = argparse.ArgumentParser(description="Validate Franka+LEAP Diffusion Policy zarr dataset.")
     parser.add_argument("--zarr-path", required=True, help="Path to the converted zarr dataset.")
     parser.add_argument(
+        "--expected-action-dim",
+        type=int,
+        default=23,
+        help="Expected action dimension in data/action. Use 11 for 4-preset hand action datasets.",
+    )
+    parser.add_argument(
+        "--expected-state-dim",
+        type=int,
+        default=23,
+        help="Expected state dimension in data/state.",
+    )
+    parser.add_argument(
         "--no-third-view",
         action="store_true",
         help="Do not require `data/third_view`.",
@@ -41,6 +53,11 @@ def main():
         help="Do not require `data/wrist_view`.",
     )
     args = parser.parse_args()
+
+    if args.expected_action_dim <= 0:
+        raise RuntimeError(f"expected-action-dim must be positive, got {args.expected_action_dim}")
+    if args.expected_state_dim <= 0:
+        raise RuntimeError(f"expected-state-dim must be positive, got {args.expected_state_dim}")
 
     zarr_path = Path(args.zarr_path).expanduser().resolve()
     if not zarr_path.exists():
@@ -57,8 +74,8 @@ def main():
     state = _require_key(data_group, "state")
     episode_ends = _require_key(meta_group, "episode_ends")
 
-    _check_shape("data/action", action, expected_ndim=2, expected_last_dim=23)
-    _check_shape("data/state", state, expected_ndim=2, expected_last_dim=23)
+    _check_shape("data/action", action, expected_ndim=2, expected_last_dim=args.expected_action_dim)
+    _check_shape("data/state", state, expected_ndim=2, expected_last_dim=args.expected_state_dim)
     _check_dtype("data/action", action, np.float32)
     _check_dtype("data/state", state, np.float32)
     _check_dtype("meta/episode_ends", episode_ends, np.int64)
@@ -110,6 +127,7 @@ def main():
     print(f"zarr_path      : {zarr_path}")
     print(f"action         : shape={action.shape}, dtype={action.dtype}")
     print(f"state          : shape={state.shape}, dtype={state.dtype}")
+    print(f"expected_dims  : action={args.expected_action_dim}, state={args.expected_state_dim}")
     if third_view is not None:
         print(f"third_view     : shape={third_view.shape}, dtype={third_view.dtype}")
     if wrist_view is not None:

@@ -26,8 +26,60 @@ THIRD_VIEW_PATH_KEY = "observation_image_third_view_path"
 WRIST_PATH_KEY = "observation_image_wrist_path"
 STATE_KEY = "observation_q"
 ACTION_KEY = "actions_delta_q"
+ABS_ACTION_KEY = "actions_q_target_abs"
 META_FILENAME = "episode_meta.json"
 NPZ_FILENAME = "data.npz"
+ARM_ACTION_DIM = 7
+HAND_ACTION_DIM = 16
+HAND_PRESET_METADATA_SUFFIX = ".hand_preset.npz"
+
+
+@dataclass(frozen=True)
+class HandPresetMetadata:
+    source_path: Path
+    hand_presets: np.ndarray
+
+    @property
+    def preset_count(self) -> int:
+        return int(self.hand_presets.shape[0])
+
+    @classmethod
+    def from_npz(cls, metadata_path: Path) -> "HandPresetMetadata":
+        metadata_path = metadata_path.expanduser().resolve()
+        with np.load(metadata_path, allow_pickle=False) as metadata:
+            representation = metadata.get("representation")
+            if representation is not None:
+                representation_value = str(np.asarray(representation).item())
+                if representation_value != "hand_preset":
+                    raise RuntimeError(
+                        f"Expected hand_preset metadata in {metadata_path}, found representation={representation_value!r}"
+                    )
+            hand_presets = np.asarray(metadata["hand_presets"], dtype=np.float32)
+            arm_action_dim = int(np.asarray(metadata.get("arm_action_dim", ARM_ACTION_DIM)).item())
+            hand_action_dim = int(np.asarray(metadata.get("hand_action_dim", HAND_ACTION_DIM)).item())
+
+        if arm_action_dim != ARM_ACTION_DIM:
+            raise RuntimeError(
+                f"Expected arm_action_dim={ARM_ACTION_DIM} in {metadata_path}, got {arm_action_dim}"
+            )
+        if hand_action_dim != HAND_ACTION_DIM:
+            raise RuntimeError(
+                f"Expected hand_action_dim={HAND_ACTION_DIM} in {metadata_path}, got {hand_action_dim}"
+            )
+        if hand_presets.ndim != 2 or hand_presets.shape[1] != HAND_ACTION_DIM:
+            raise RuntimeError(
+                f"Expected hand_presets with shape [K, {HAND_ACTION_DIM}], got {hand_presets.shape} in {metadata_path}"
+            )
+        return cls(source_path=metadata_path, hand_presets=hand_presets)
+
+    def assign_many(self, hand_targets_q: np.ndarray) -> np.ndarray:
+        hand_targets_q = np.asarray(hand_targets_q, dtype=np.float32)
+        if hand_targets_q.ndim != 2 or hand_targets_q.shape[1] != HAND_ACTION_DIM:
+            raise RuntimeError(
+                f"Expected hand target array with shape [T, {HAND_ACTION_DIM}], got {hand_targets_q.shape}"
+            )
+        distances = np.sum(np.square(hand_targets_q[:, None, :] - self.hand_presets[None, :, :]), axis=-1)
+        return np.argmin(distances, axis=1).astype(np.int32)
 
 
 @dataclass(frozen=True)
@@ -81,6 +133,7 @@ def _validate_episode_arrays(
     episode_dir: Path,
     include_third_view: bool,
     include_wrist: bool,
+    action_representation: str,
 ) -> int:
     if STATE_KEY not in data.files:
         raise RuntimeError(f"Missing key `{STATE_KEY}` in {episode_dir / NPZ_FILENAME}")
@@ -88,22 +141,39 @@ def _validate_episode_arrays(
         raise RuntimeError(f"Missing key `{ACTION_KEY}` in {episode_dir / NPZ_FILENAME}")
 
     state = data[STATE_KEY]
-    action = data[ACTION_KEY]
+    raw_action = data[ACTION_KEY]
     if state.ndim != 2 or state.shape[1] != 23:
         raise RuntimeError(
             f"Expected `{STATE_KEY}` shape (T, 23), got {state.shape} in {episode_dir / NPZ_FILENAME}"
         )
-    if action.ndim != 2 or action.shape[1] != 23:
+    if raw_action.ndim != 2 or raw_action.shape[1] != 23:
         raise RuntimeError(
-            f"Expected `{ACTION_KEY}` shape (T, 23), got {action.shape} in {episode_dir / NPZ_FILENAME}"
+            f"Expected `{ACTION_KEY}` shape (T, 23), got {raw_action.shape} in {episode_dir / NPZ_FILENAME}"
         )
 
-    num_steps = int(action.shape[0])
+    num_steps = int(raw_action.shape[0])
     if state.shape[0] != num_steps:
         raise RuntimeError(
             f"Length mismatch in {episode_dir / NPZ_FILENAME}: "
             f"`{STATE_KEY}` has {state.shape[0]}, `{ACTION_KEY}` has {num_steps}"
         )
+
+    if action_representation == "hand_preset":
+        if ABS_ACTION_KEY not in data.files:
+            raise RuntimeError(
+                f"Missing key `{ABS_ACTION_KEY}` required for action_representation='hand_preset' "
+                f"in {episode_dir / NPZ_FILENAME}"
+            )
+        abs_action = data[ABS_ACTION_KEY]
+        if abs_action.ndim != 2 or abs_action.shape[1] != 23:
+            raise RuntimeError(
+                f"Expected `{ABS_ACTION_KEY}` shape (T, 23), got {abs_action.shape} in {episode_dir / NPZ_FILENAME}"
+            )
+        if abs_action.shape[0] != num_steps:
+            raise RuntimeError(
+                f"Length mismatch in {episode_dir / NPZ_FILENAME}: "
+                f"`{ABS_ACTION_KEY}` has {abs_action.shape[0]}, `{ACTION_KEY}` has {num_steps}"
+            )
 
     if include_third_view:
         if THIRD_VIEW_PATH_KEY not in data.files:
@@ -158,12 +228,43 @@ def _load_image_sequence(
     return np.stack(frames, axis=0).astype(np.uint8, copy=False), local_shape
 
 
+def _encode_actions(
+    *,
+    raw_action: np.ndarray,
+    abs_action: Optional[np.ndarray],
+    action_representation: str,
+    hand_preset_metadata: Optional[HandPresetMetadata],
+    episode_dir: Path,
+) -> np.ndarray:
+    raw_action = np.asarray(raw_action, dtype=np.float32)
+    if action_representation == "delta_q":
+        return raw_action
+
+    if action_representation != "hand_preset":
+        raise RuntimeError(f"Unsupported action_representation={action_representation!r}")
+    if hand_preset_metadata is None:
+        raise RuntimeError("hand_preset conversion requires preset metadata.")
+    if abs_action is None:
+        raise RuntimeError(
+            f"Expected `{ABS_ACTION_KEY}` to encode hand_preset actions in {episode_dir / NPZ_FILENAME}"
+        )
+
+    abs_action = np.asarray(abs_action, dtype=np.float32)
+    hand_targets = abs_action[:, ARM_ACTION_DIM:]
+    preset_ids = hand_preset_metadata.assign_many(hand_targets)
+    preset_onehot = np.eye(hand_preset_metadata.preset_count, dtype=np.float32)[preset_ids]
+    encoded = np.concatenate([raw_action[:, :ARM_ACTION_DIM], preset_onehot], axis=1)
+    return encoded.astype(np.float32, copy=False)
+
+
 def _load_episode_record(
     episode_dir: Path,
     *,
     include_third_view: bool,
     include_wrist: bool,
     expected_shapes: dict[str, Optional[tuple[int, int, int]]],
+    action_representation: str,
+    hand_preset_metadata: Optional[HandPresetMetadata],
 ) -> EpisodeRecord:
     meta = _load_episode_meta(episode_dir)
 
@@ -173,10 +274,19 @@ def _load_episode_record(
             episode_dir=episode_dir,
             include_third_view=include_third_view,
             include_wrist=include_wrist,
+            action_representation=action_representation,
         )
 
         state = np.asarray(data[STATE_KEY], dtype=np.float32)
-        action = np.asarray(data[ACTION_KEY], dtype=np.float32)
+        raw_action = np.asarray(data[ACTION_KEY], dtype=np.float32)
+        abs_action = np.asarray(data[ABS_ACTION_KEY], dtype=np.float32) if action_representation == "hand_preset" else None
+        action = _encode_actions(
+            raw_action=raw_action,
+            abs_action=abs_action,
+            action_representation=action_representation,
+            hand_preset_metadata=hand_preset_metadata,
+            episode_dir=episode_dir,
+        )
 
         third_view = None
         if include_third_view:
@@ -220,6 +330,18 @@ def _remove_output_path(path: Path):
         path.unlink()
 
 
+def _copy_hand_preset_metadata(
+    *,
+    output_path: Path,
+    hand_preset_metadata: Optional[HandPresetMetadata],
+) -> Optional[Path]:
+    if hand_preset_metadata is None:
+        return None
+    metadata_copy_path = output_path.parent / f"{output_path.name}{HAND_PRESET_METADATA_SUFFIX}"
+    shutil.copy2(hand_preset_metadata.source_path, metadata_copy_path)
+    return metadata_copy_path
+
+
 def _write_manifest(
     *,
     output_path: Path,
@@ -227,12 +349,20 @@ def _write_manifest(
     skipped: list[dict],
     include_third_view: bool,
     include_wrist: bool,
+    action_representation: str,
+    action_shape: tuple[int, ...],
+    preset_metadata_source: Optional[Path],
+    preset_metadata_copy: Optional[Path],
 ):
     manifest = {
         "num_kept_episodes": len(kept_records),
         "num_skipped_episodes": len(skipped),
         "include_third_view": include_third_view,
         "include_wrist": include_wrist,
+        "action_representation": action_representation,
+        "action_shape": list(action_shape),
+        "preset_metadata_source": None if preset_metadata_source is None else str(preset_metadata_source),
+        "preset_metadata_copy": None if preset_metadata_copy is None else str(preset_metadata_copy),
         "kept_episodes": [
             {
                 "episode_dir": str(record.episode_dir),
@@ -269,6 +399,19 @@ def _write_manifest(
     show_default=True,
     help="Compression preset passed to ReplayBuffer when arrays are first created.",
 )
+@click.option(
+    "--action-representation",
+    type=click.Choice(["delta_q", "hand_preset"]),
+    default="delta_q",
+    show_default=True,
+    help="Action representation to write into zarr.",
+)
+@click.option(
+    "--preset-metadata",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to franka_leap_hand_action_repr.npz. Required for action_representation=hand_preset.",
+)
 def main(
     input_dir: Path,
     output: Path,
@@ -278,6 +421,8 @@ def main(
     include_wrist: bool,
     allow_missing_cameras: bool,
     compressor: str,
+    action_representation: str,
+    preset_metadata: Optional[Path],
 ):
     if not include_third_view and not include_wrist:
         raise click.ClickException("At least one image stream must be enabled for the image-based DP baseline.")
@@ -285,14 +430,29 @@ def main(
     input_dir = input_dir.expanduser().resolve()
     output = output.expanduser().resolve()
 
+    hand_preset_metadata = None
+    if action_representation == "hand_preset":
+        if preset_metadata is None:
+            raise click.ClickException(
+                "--preset-metadata is required when --action-representation=hand_preset."
+            )
+        hand_preset_metadata = HandPresetMetadata.from_npz(preset_metadata)
+    elif preset_metadata is not None:
+        raise click.ClickException(
+            "--preset-metadata is only valid when --action-representation=hand_preset."
+        )
+
     episode_dirs = _find_episode_dirs(input_dir)
     if not episode_dirs:
         raise click.ClickException(f"No episode directories found under: {input_dir}")
 
+    metadata_copy_path = output.parent / f"{output.name}{HAND_PRESET_METADATA_SUFFIX}"
     if output.exists():
         if not overwrite:
             raise click.ClickException(f"Output already exists: {output}. Pass --overwrite to replace it.")
         _remove_output_path(output)
+    if metadata_copy_path.exists():
+        _remove_output_path(metadata_copy_path)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     replay_buffer = ReplayBuffer.create_empty_zarr(storage=zarr.DirectoryStore(str(output)))
@@ -319,6 +479,8 @@ def main(
                 include_third_view=include_third_view,
                 include_wrist=include_wrist,
                 expected_shapes=expected_shapes,
+                action_representation=action_representation,
+                hand_preset_metadata=hand_preset_metadata,
             )
         except RuntimeError as exc:
             if allow_missing_cameras and (
@@ -350,20 +512,34 @@ def main(
         _remove_output_path(output)
         raise click.ClickException("No episodes were converted. Nothing written.")
 
+    metadata_copy = _copy_hand_preset_metadata(
+        output_path=output,
+        hand_preset_metadata=hand_preset_metadata,
+    )
+
     manifest_path = output.parent / f"{output.name}.manifest.json"
+    action_shape = tuple(int(x) for x in kept_records[0].action.shape[1:])
     _write_manifest(
         output_path=output,
         kept_records=kept_records,
         skipped=skipped,
         include_third_view=include_third_view,
         include_wrist=include_wrist,
+        action_representation=action_representation,
+        action_shape=action_shape,
+        preset_metadata_source=None if hand_preset_metadata is None else hand_preset_metadata.source_path,
+        preset_metadata_copy=metadata_copy,
     )
 
     click.echo(f"Converted episodes: {len(kept_records)}")
     click.echo(f"Skipped episodes: {len(skipped)}")
     click.echo(f"Total timesteps: {total_steps}")
+    click.echo(f"Action representation: {action_representation}")
+    click.echo(f"Action shape: {action_shape}")
     click.echo(f"Output zarr: {output}")
     click.echo(f"Manifest: {manifest_path}")
+    if metadata_copy is not None:
+        click.echo(f"Preset metadata copy: {metadata_copy}")
     if include_third_view:
         click.echo(f"third_view shape: {expected_shapes['third_view']}")
     if include_wrist:

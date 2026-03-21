@@ -1,0 +1,33 @@
+name: franka_leap_image_hand_preset
+
+dataset_path: data/grasp_box_200_hand_preset.zarr
+
+shape_meta: &shape_meta
+  obs:
+    third_view:
+      shape: [3, 540, 640]
+      type: rgb
+    wrist_view:
+      shape: [3, 480, 640]
+      type: rgb
+    state:
+      shape: [23]
+      type: low_dim
+  action:
+    shape: [11]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.null_image_runner.NullImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.franka_leap_image_dataset.FrankaLeapImageDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  load_to_memory: False
